@@ -1,39 +1,87 @@
 # Nexora
 
-Nexora is a production-grade, Linear-inspired Agile sprint and Kanban workspace for software teams. It pairs a fast, keyboard-first interface with a clean service layer designed to plug into a Django REST Framework backend in Phase 2.
+Nexora is a Linear-inspired Agile sprint and Kanban workspace for software teams. It pairs a fast, keyboard-first React interface with a Django REST Framework API, JWT authentication, and a seeded PostgreSQL/SQLite data layer.
 
-**Phase 1 (this release):** a fully interactive frontend — recruiter demo login, a seeded Sprint 14 workspace, a five-column drag-and-drop board, issue detail drawer, comments and activity, global command palette, and dark/light theming — backed by a realistic local mock API.
+**Phase 2 (this release):** the frontend is wired to the Django API. Demo login, sprint boards, issue creation and editing, drag-and-drop moves, comments, activity logs, filters, and the command palette all run against the backend. The original local mock API remains as an offline fallback.
 
 ## Highlights
 
-- **One-click recruiter demo** — no signup; opens *Nexora Core Engineering — Sprint 14* fully seeded with engineering issues.
-- **Kanban board with @dnd-kit** — reorder within a column or drag across `Backlog`, `Todo`, `In Progress`, `In Review`, and `Done` with optimistic 0 ms updates and rollback on failure.
-- **Issue detail drawer** — inline title/description editing, status, priority, assignee, labels, story points, activity log, and comments.
-- **Command palette** — `⌘K` / `Ctrl+K` to jump to issues, create one, filter by priority, toggle theme, or sign out.
-- **Filters and search** — real-time text search plus multi-select priority, assignee, and label filters.
-- **Dark-first design system** — Tailwind tokens, 1 px subtle borders, Inter/Geist typography, and a working theme toggle.
-- **Responsive** — collapsible desktop sidebar, mobile navigation drawer, horizontally scrollable board.
+- **One-click recruiter demo** — isolated sandbox, reset on every demo login; 20 issues across three sprints.
+- **Kanban board with @dnd-kit** — optimistic drag-and-drop across `Backlog`, `Todo`, `In Progress`, `In Review`, and `Done`, reconciled with the server.
+- **Atomic task moves** — row-locked, transactional reordering with contiguous positions in both source and destination columns.
+- **Issue detail drawer** — inline editing for title, description, status, priority, assignee, labels, and story points, plus comments and automatically logged activity.
+- **JWT auth** — access/refresh tokens, automatic refresh on `401`, and a secure demo account.
+- **Optimized board reads** — `select_related`/`prefetch_related` keeps the board endpoint bounded to a small number of queries (asserted in tests).
+- **Graceful degradation** — if the API is unreachable, the UI falls back to the seeded browser sandbox instead of breaking.
+- **Dark-first design system** — Tailwind tokens, subtle borders, Inter/Geist typography, and a working theme toggle.
 
 ## Repository structure
 
-```
+```text
 Nexora/
-├── frontend/            # React 18 + TypeScript + Vite application
-│   ├── public/
+├── backend/
+│   ├── nexora_core/          # settings, root URLs, WSGI/ASGI
+│   ├── boards/
+│   │   ├── management/commands/seed_nexora.py
+│   │   ├── migrations/
+│   │   ├── admin.py
+│   │   ├── models.py         # Workspace, Sprint, Column, Task, ActivityComment
+│   │   ├── serializers.py
+│   │   ├── services.py       # issue keys, workspace bootstrap, atomic moves, logs
+│   │   ├── seed.py           # team + demo workspace data
+│   │   ├── tests.py
+│   │   ├── urls.py
+│   │   └── views.py
+│   ├── .env.example
+│   ├── manage.py
+│   └── requirements.txt
+├── frontend/
 │   └── src/
-│       ├── components/  # auth, board, command palette, issue drawer, layout, ui
-│       ├── lib/         # design tokens, helpers, task ordering/filtering
-│       ├── pages/       # login and workspace screens
-│       ├── services/    # api.ts (mock now, DRF in Phase 2) + seed data
-│       ├── store/       # zustand stores (auth, board, UI)
-│       └── types/       # shared domain interfaces
-├── backend/             # Placeholder — Django REST Framework (Phase 2)
+│       ├── components/       # auth, board, command palette, issue drawer, layout, ui
+│       ├── lib/              # design tokens, helpers, task ordering/filtering
+│       ├── pages/            # login and workspace screens
+│       ├── services/
+│       │   ├── api.ts        # remote API facade + response mapping
+│       │   ├── http.ts       # JWT fetch client, refresh, typed errors
+│       │   ├── mockApi.ts    # offline fallback
+│       │   └── mockData.ts
+│       ├── store/            # zustand stores (auth, board, UI)
+│       └── types/            # shared domain interfaces
 └── README.md
 ```
 
 ## Getting started
 
-**Requirements:** Node.js 18+ and npm 9+.
+**Requirements:** Python 3.11+ and Node.js 18+.
+
+### 1. Backend
+
+```bash
+cd backend
+python -m venv .venv
+
+# Windows: .venv\Scripts\activate
+# macOS/Linux: source .venv/bin/activate
+pip install -r requirements.txt
+
+# Optional: copy .env.example to .env and adjust values.
+# SQLite is used automatically when DATABASE_URL is not set.
+python manage.py migrate
+python manage.py seed_nexora
+python manage.py runserver 127.0.0.1:8000
+```
+
+The API is served at `http://localhost:8000/api`.
+
+To use PostgreSQL instead, set `DATABASE_URL` in `backend/.env`:
+
+```env
+DATABASE_URL=postgres://nexora:nexora@localhost:5432/nexora
+```
+
+### 2. Frontend
+
+In a second terminal:
 
 ```bash
 cd frontend
@@ -43,62 +91,92 @@ npm run dev
 
 Open [http://localhost:5173](http://localhost:5173).
 
-### Try it immediately
+The frontend uses `http://localhost:8000/api` by default. Override it with `VITE_API_BASE_URL` if the API runs elsewhere.
 
-Click **One-Click Demo Login (Recruiter Sandbox)** on the sign-in screen. The sandbox loads the seeded *Nexora Core Engineering — Sprint 14* workspace with 12 engineering issues, seven teammates, labels, story points, activity, and comments.
+### Demo login
 
-Email/password sign-in also works in the sandbox with any valid email and a password of six or more characters.
+Click **One-Click Demo Login** on the sign-in screen. Manual credentials:
+
+```text
+Email:    demo@nexora.dev
+Password: nexora-demo
+```
+
+The demo endpoint resets the `recruiter-demo` workspace on every call, so the sandbox is always in a known state.
 
 ### Useful commands
 
-| Command | Description |
-| --- | --- |
-| `npm run dev` | Start the Vite dev server |
-| `npm run build` | Type-check and create a production build |
-| `npm run typecheck` | Run TypeScript with zero-error enforcement |
-| `npm run preview` | Preview the production build |
+| Location | Command | Description |
+| --- | --- | --- |
+| `backend/` | `python manage.py test boards` | Run the API test suite |
+| `backend/` | `python manage.py seed_nexora` | Rebuild the demo workspace |
+| `frontend/` | `npm run dev` | Start the Vite dev server |
+| `frontend/` | `npm run typecheck` | Type-check with zero-error enforcement |
+| `frontend/` | `npm run build` | Type-check and create a production build |
+| `frontend/` | `npm run preview` | Preview the production build |
 
-## Demo workspace
+## API
 
-- **Workspace:** Nexora Core Engineering
-- **Sprints:** Sprint 14 (Active), Sprint 13 (Completed), Backlog
-- **Board:** Backlog, Todo, In Progress, In Review, Done
-- **Seed data:** 12 active-sprint issues with realistic titles, descriptions, priorities, story points, assignees, labels, activity, and comments
+All endpoints are prefixed with `/api`. Authenticated requests send:
 
-State changes are persisted in your browser's `localStorage`, so the board survives refreshes. To reset the sandbox, clear the `nexora.db.v1` and `nexora.session.v1` keys (or all site data) and reload.
-
-## API abstraction
-
-Every read and mutation goes through `frontend/src/services/api.ts`:
-
-```ts
-demoLogin()                  // POST /api/v1/auth/demo-login/
-login(email, password)       // POST /api/v1/auth/login/
-getBoardData(sprintId?)      // GET  /api/v1/workspaces/:id/board/
-createTask(input)            // POST /api/v1/issues/
-updateTask(id, patch)        // PATCH /api/v1/issues/:id/
-moveTask({ taskId, toStatus, toIndex }) // POST /api/v1/issues/:id/move/
-addComment(taskId, body)     // POST /api/v1/issues/:id/comments/
+```http
+Authorization: Bearer <access-token>
 ```
 
-The shared interfaces in `frontend/src/types/index.ts` (`Workspace`, `Sprint`, `Column`, `Task`, `User`, `Comment`, plus filter and mutation inputs) are written to map directly to DRF serializers. In Phase 2 only the function bodies change; UI and state code stay untouched.
+| Method | Endpoint | Purpose |
+| --- | --- | --- |
+| `POST` | `/api/auth/login/` | Log in with `email` (or `username`) and `password`; returns access/refresh tokens |
+| `POST` | `/api/auth/refresh/` | Exchange a refresh token for a new access token |
+| `POST` | `/api/auth/demo-login/` | Create/reset the recruiter sandbox and return tokens |
+| `GET` | `/api/workspaces/current/board/?sprint=<id>` | Optimized board payload for the current workspace |
+| `POST` | `/api/tasks/` | Create an issue |
+| `PATCH` | `/api/tasks/<id>/` | Update an issue (`title`, `description`, `priority`, `story_points`, `assignee_id`, `label`, `column`) |
+| `POST` | `/api/tasks/<id>/move/` | Atomically move an issue: `{ "target_column_id": 2, "new_position": 0 }` |
+| `GET` | `/api/tasks/<id>/comments/` | List comments and system activity for an issue |
+| `POST` | `/api/tasks/<id>/comments/` | Add a comment: `{ "content": "..." }` |
+
+The board response includes the workspace, active sprint, all sprints, ordered columns with nested tasks, a flattened task list, members, labels, and sprint stats (`total_tasks`, `completed_tasks`, story points, completion percentage). System activity is returned alongside comments and flagged with `is_system_log`.
+
+### Authentication flow
+
+1. `POST /api/auth/demo-login/` (or `/api/auth/login/`) returns `access`, `refresh`, and the current user.
+2. The frontend stores tokens in `localStorage` and sends the access token with every request.
+3. On a `401`, `frontend/src/services/http.ts` refreshes once, retries the request, and clears tokens if the refresh fails.
+4. Signing out clears both tokens and the session.
+
+### Offline fallback
+
+The mock API is retained for demo resilience. If login or a board request fails because the backend is unreachable (connection error, timeout, or `5xx`), the frontend switches to the seeded localStorage sandbox. Mutations then operate on that sandbox until the user signs in again. A reachable backend always takes precedence.
+
+## Data model
+
+- **Workspace** — owner, name, slug, demo-sandbox flag.
+- **Sprint** — workspace, name, status (`planned` / `active` / `completed`), dates.
+- **Column** — sprint, title, slug, position; unique per sprint.
+- **Task** — issue key (for example `NEX-112`), title, description, priority, label, story points, assignee, column, position, timestamps.
+- **ActivityComment** — task, author, content, `is_system_log`, created timestamp. Issue creation, priority changes, and column moves are recorded automatically.
+
+Task moves run inside `transaction.atomic()` with row locks. Positions are clamped and renumbered to stay contiguous in both columns. Issue keys are generated per workspace.
+
+## Tests
+
+The backend covers JWT login, demo auth, board shape/ordering, query-count regression, sprint filtering, atomic moves, system activity logs, issue creation, and comments:
+
+```bash
+cd backend
+python manage.py test boards
+```
+
+The frontend is verified with `npm run typecheck` and `npm run build`.
 
 ## Tech stack
 
-- React 18, TypeScript, Vite
-- Tailwind CSS (CSS-variable theme tokens, dark mode by default)
-- `@dnd-kit` for accessible multi-column drag and drop
-- `cmdk` for the global command palette
-- `zustand` for client state and optimistic mutations
-- `framer-motion` for drawers, modals, and micro-interactions
-- `lucide-react` for icons
+**Frontend:** React 18, TypeScript, Vite, Tailwind CSS, `@dnd-kit`, `cmdk`, `zustand`, `framer-motion`, `lucide-react`.
+
+**Backend:** Django 5, Django REST Framework, SimpleJWT, django-cors-headers, django-filter, psycopg2, python-dotenv.
 
 ## Roadmap
 
 - [x] **Phase 1** — Frontend application, mock data layer, demo experience
-- [ ] **Phase 2** — Django REST Framework backend, authentication, CRUD and board APIs
+- [x] **Phase 2** — Django REST Framework backend, JWT authentication, board/CRUD/move/comment APIs, frontend integration
 - [ ] **Phase 3** — Realtime collaboration, notifications, analytics, and deployment
-
-## Notes
-
-This repository is the Phase 1 hand-off. The `backend/` directory is intentionally empty and reserved for the Phase 2 Django REST Framework service.

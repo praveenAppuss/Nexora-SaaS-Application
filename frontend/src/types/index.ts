@@ -80,7 +80,8 @@ export type ActivityType =
   | 'title_changed'
   | 'description_changed'
   | 'labels_changed'
-  | 'points_changed';
+  | 'points_changed'
+  | 'updated';
 
 export interface Activity {
   id: string;

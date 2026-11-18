@@ -237,7 +237,7 @@ export default function LoginPage() {
                         type="email"
                         autoComplete="email"
                         inputMode="email"
-                        placeholder="you@company.com"
+                        placeholder="demo@nexora.dev"
                         value={email}
                         onChange={(event) => {
                           setEmail(event.target.value);
@@ -255,7 +255,7 @@ export default function LoginPage() {
                         Password
                       </label>
                       <span className="mb-1.5 text-[9px] text-subtle">
-                        Sandbox: 6+ characters
+                        Demo: nexora-demo
                       </span>
                     </div>
                     <div className="relative">
@@ -313,7 +313,8 @@ export default function LoginPage() {
                 </form>
 
                 <p className="mt-4 text-center text-[9px] leading-relaxed text-subtle">
-                  Sandbox authentication. No registration, no data leaves your browser.
+                  Manual demo: demo@nexora.dev / nexora-demo. The sandbox resets on
+                  every demo login.
                 </p>
               </div>
 

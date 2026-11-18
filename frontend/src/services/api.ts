@@ -1,83 +1,330 @@
 /**
  * Nexora data access layer.
  *
- * Phase 1 runs against a seeded localStorage store so the product works with
- * zero setup. Every function is async and accepts/returns DRF-serializer-shaped
- * types, so Phase 2 only swaps the implementation body for fetch calls:
+ * Every call goes to the Django REST Framework API first. If the backend is
+ * unreachable (for example during a frontend-only demo), authentication falls
+ * back to the seeded localStorage sandbox so the UI remains fully usable.
  *
- *   POST  /api/v1/auth/demo-login/
- *   POST  /api/v1/auth/login/
- *   GET   /api/v1/workspaces/:id/board/?sprint=:sprintId
- *   POST  /api/v1/issues/
- *   PATCH /api/v1/issues/:id/
- *   POST  /api/v1/issues/:id/move/
- *   POST  /api/v1/issues/:id/comments/
+ * Remote endpoints:
+ *   POST  /api/auth/login/                  JWT login (email or username)
+ *   POST  /api/auth/refresh/                JWT refresh
+ *   POST  /api/auth/demo-login/             Recruiter sandbox
+ *   GET   /api/workspaces/current/board/    Active sprint board
+ *   POST  /api/tasks/                       Create issue
+ *   PATCH /api/tasks/:id/                   Update issue
+ *   POST  /api/tasks/:id/move/              Atomic drag-and-drop move
+ *   POST  /api/tasks/:id/comments/          Post a comment
  */
 import type {
   Activity,
+  ActivityType,
   AuthSession,
+  AvatarColor,
   BoardData,
   Comment,
   CreateTaskInput,
+  Label,
   MoveTaskInput,
   Priority,
   Sprint,
+  SprintStatus,
   Task,
   TaskStatus,
   UpdateTaskInput,
   User,
+  Workspace,
 } from '../types';
-import { PRIORITY_META, STATUS_META, TASK_STATUSES } from '../lib/constants';
-import { reorderTaskList } from '../lib/tasks';
+import { isTaskStatus, PRIORITIES } from '../lib/constants';
+import { initialsFromName } from '../lib/utils';
 import {
-  createSeedDatabase,
-  DB_VERSION,
-  DEMO_USER_ID,
-  type MockDatabase,
-} from './mockData';
+  ApiError,
+  apiFetch,
+  clearTokens,
+  getTokens,
+  isBackendUnavailable,
+  setTokens,
+} from './http';
+import * as mockApi from './mockApi';
 
-const DB_KEY = 'nexora.db.v1';
-const SESSION_KEY = 'nexora.session.v1';
-const DEFAULT_LATENCY = 120;
+const REMOTE_SESSION_KEY = 'nexora.session.v2';
+const LABEL_VALUES = ['Frontend', 'Backend', 'Bug', 'API', 'UI/UX'];
 
-const wait = (ms = DEFAULT_LATENCY): Promise<void> =>
-  new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
+type ApiMode = 'remote' | 'mock';
+let apiMode: ApiMode | null = null;
+let currentSprintId: string | null = null;
+const columnIds = new Map<string, number>();
 
-function clone<T>(value: T): T {
-  return JSON.parse(JSON.stringify(value)) as T;
+// --------------------------------------------------------------- API types
+
+interface ApiUser {
+  id: number;
+  username: string;
+  email: string;
+  first_name: string;
+  last_name: string;
+  name: string;
 }
 
-function readDatabase(): MockDatabase {
-  try {
-    const raw = window.localStorage.getItem(DB_KEY);
-    if (raw) {
-      const parsed = JSON.parse(raw) as MockDatabase;
-      if (parsed && parsed.version === DB_VERSION && Array.isArray(parsed.tasks)) {
-        return parsed;
-      }
-    }
-  } catch {
-    // Corrupt or unavailable storage: fall back to a fresh seed.
+interface ApiComment {
+  id: number;
+  task: number;
+  author: ApiUser;
+  content: string;
+  is_system_log: boolean;
+  created_at: string;
+}
+
+interface ApiTask {
+  id: number;
+  issue_key: string;
+  title: string;
+  description: string;
+  column: number;
+  column_slug: string;
+  sprint_id: number;
+  workspace_id: number;
+  priority: string;
+  label: string;
+  story_points: number;
+  assignee: ApiUser | null;
+  position: number;
+  created_at: string;
+  updated_at: string;
+  comments: ApiComment[];
+}
+
+interface ApiColumn {
+  id: number;
+  title: string;
+  slug: string;
+  position: number;
+  task_count: number;
+  story_points: number;
+  tasks: ApiTask[];
+}
+
+interface ApiSprint {
+  id: number;
+  workspace: number;
+  name: string;
+  status: string;
+  start_date: string | null;
+  end_date: string | null;
+}
+
+interface ApiWorkspace {
+  id: number;
+  name: string;
+  slug: string;
+  owner: number;
+  is_demo_sandbox: boolean;
+  created_at: string;
+}
+
+interface ApiLabel {
+  id: string;
+  name: string;
+  color: string;
+}
+
+interface ApiBoard {
+  workspace: ApiWorkspace;
+  sprint: ApiSprint;
+  sprints: ApiSprint[];
+  columns: ApiColumn[];
+  tasks: ApiTask[];
+  members: ApiUser[];
+  labels: ApiLabel[];
+  stats: {
+    total_tasks: number;
+    completed_tasks: number;
+    total_story_points: number;
+    completed_story_points: number;
+    completion_percentage: number;
+  };
+}
+
+interface ApiAuthResponse {
+  access: string;
+  refresh: string;
+  token_type: string;
+  user: ApiUser;
+  workspace_id: number;
+  is_demo: boolean;
+}
+
+interface ApiMoveResponse {
+  task: ApiTask;
+  tasks: ApiTask[];
+}
+
+// ------------------------------------------------------------------ mapping
+
+const AVATAR_COLORS: AvatarColor[] = [
+  'indigo',
+  'pink',
+  'emerald',
+  'amber',
+  'sky',
+  'violet',
+  'rose',
+];
+
+const LABEL_COLORS: Record<string, Label['color']> = {
+  Frontend: 'blue',
+  Backend: 'emerald',
+  Bug: 'red',
+  API: 'violet',
+  'UI/UX': 'amber',
+};
+
+function mapUser(user: ApiUser): User {
+  const name =
+    user.name?.trim() ||
+    [user.first_name, user.last_name].filter(Boolean).join(' ') ||
+    user.username;
+  return {
+    id: String(user.id),
+    name,
+    email: user.email,
+    role: 'Nexora team member',
+    avatarColor: AVATAR_COLORS[Math.abs(user.id) % AVATAR_COLORS.length],
+    initials: initialsFromName(name),
+  };
+}
+
+function mapPriority(value: string): Priority {
+  return (PRIORITIES as string[]).includes(value) ? (value as Priority) : 'medium';
+}
+
+function mapSprintStatus(value: string): SprintStatus {
+  if (value === 'active' || value === 'completed' || value === 'planned') {
+    return value;
   }
-
-  const seeded = createSeedDatabase();
-  writeDatabase(seeded);
-  return seeded;
+  return 'planned';
 }
 
-function writeDatabase(database: MockDatabase): void {
-  try {
-    window.localStorage.setItem(DB_KEY, JSON.stringify(database));
-  } catch {
-    // Storage can be unavailable in private browsing; the in-memory session still works.
+function inferActivityType(message: string): ActivityType {
+  const text = message.toLowerCase();
+  if (text.includes('moved')) return 'status_changed';
+  if (text.includes('priority')) return 'priority_changed';
+  if (text.includes('assign')) return 'assignee_changed';
+  if (text.includes('label')) return 'labels_changed';
+  if (text.includes('story points')) return 'points_changed';
+  if (text.includes('description')) return 'description_changed';
+  if (text.includes('renamed') || text.includes('title')) return 'title_changed';
+  return 'updated';
+}
+
+function mapComment(comment: ApiComment, taskId: string): Comment {
+  return {
+    id: String(comment.id),
+    taskId,
+    author: mapUser(comment.author),
+    body: comment.content,
+    createdAt: comment.created_at,
+  };
+}
+
+function mapTask(task: ApiTask): Task {
+  const taskId = String(task.id);
+  const systemLogs = task.comments.filter((comment) => comment.is_system_log);
+  const comments = task.comments.filter((comment) => !comment.is_system_log);
+
+  const activity: Activity[] = systemLogs.map((comment) => ({
+    id: `activity-${comment.id}`,
+    taskId,
+    actor: mapUser(comment.author),
+    type: inferActivityType(comment.content),
+    message: comment.content,
+    createdAt: comment.created_at,
+  }));
+
+  return {
+    id: taskId,
+    key: task.issue_key,
+    workspaceId: String(task.workspace_id),
+    sprintId: String(task.sprint_id),
+    title: task.title,
+    description: task.description,
+    status: isTaskStatus(task.column_slug) ? task.column_slug : 'backlog',
+    priority: mapPriority(task.priority),
+    storyPoints: task.story_points,
+    assigneeId: task.assignee ? String(task.assignee.id) : null,
+    labelIds: task.label ? [task.label] : [],
+    order: task.position,
+    createdAt: task.created_at,
+    updatedAt: task.updated_at,
+    comments: comments.map((comment) => mapComment(comment, taskId)),
+    activity,
+  };
+}
+
+function mapBoard(payload: ApiBoard): BoardData {
+  const workspace: Workspace = {
+    id: String(payload.workspace.id),
+    name: payload.workspace.name,
+    slug: payload.workspace.slug,
+    description: 'Nexora engineering workspace.',
+    memberIds: payload.members.map((member) => String(member.id)),
+  };
+
+  const sprints: Sprint[] = payload.sprints.map((sprint) => ({
+    id: String(sprint.id),
+    workspaceId: String(sprint.workspace),
+    name: sprint.name,
+    status: mapSprintStatus(sprint.status),
+    goal: '',
+    startDate: sprint.start_date,
+    endDate: sprint.end_date,
+  }));
+
+  const sprint = sprints.find(
+    (item) => item.id === String(payload.sprint.id),
+  ) ?? {
+    id: String(payload.sprint.id),
+    workspaceId: String(payload.sprint.workspace),
+    name: payload.sprint.name,
+    status: mapSprintStatus(payload.sprint.status),
+    goal: '',
+    startDate: payload.sprint.start_date,
+    endDate: payload.sprint.end_date,
+  };
+
+  const labels: Label[] = payload.labels.map((label) => ({
+    id: label.id,
+    name: label.name,
+    color: LABEL_COLORS[label.id] ?? 'blue',
+  }));
+
+  columnIds.clear();
+  for (const column of payload.columns) {
+    columnIds.set(`${sprint.id}:${column.slug}`, column.id);
   }
+  currentSprintId = sprint.id;
+
+  return {
+    workspace,
+    sprint,
+    sprints,
+    columns: payload.columns
+      .map((column) => ({
+        id: isTaskStatus(column.slug) ? column.slug : ('backlog' as TaskStatus),
+        name: column.title,
+        order: column.position,
+      }))
+      .sort((a, b) => a.order - b.order),
+    tasks: payload.tasks.map(mapTask),
+    members: payload.members.map(mapUser),
+    labels,
+  };
 }
 
-function readSession(): AuthSession | null {
+// ------------------------------------------------------------------ session
+
+function readRemoteSession(): AuthSession | null {
   try {
-    const raw = window.localStorage.getItem(SESSION_KEY);
+    const raw = window.localStorage.getItem(REMOTE_SESSION_KEY);
     if (!raw) return null;
     return JSON.parse(raw) as AuthSession;
   } catch {
@@ -85,380 +332,262 @@ function readSession(): AuthSession | null {
   }
 }
 
-function writeSession(session: AuthSession): void {
+function writeRemoteSession(session: AuthSession): void {
   try {
-    window.localStorage.setItem(SESSION_KEY, JSON.stringify(session));
+    window.localStorage.setItem(REMOTE_SESSION_KEY, JSON.stringify(session));
   } catch {
     // Ignore storage failures.
   }
 }
 
-function currentUser(database: MockDatabase): User {
-  const session = readSession();
-  const user =
-    database.users.find((member) => member.id === session?.user.id) ??
-    database.users.find((member) => member.id === DEMO_USER_ID) ??
-    database.users[0];
-  if (!user) throw new Error('The workspace has no members.');
-  return user;
+function clearRemoteSession(): void {
+  try {
+    window.localStorage.removeItem(REMOTE_SESSION_KEY);
+  } catch {
+    // Ignore storage failures.
+  }
 }
 
-function createSession(user: User, workspaceId: string, isDemo: boolean): AuthSession {
-  return {
-    token: `sandbox_${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`,
-    user: clone(user),
-    workspaceId,
+function persistAuth(
+  payload: ApiAuthResponse,
+  isDemo: boolean,
+): AuthSession {
+  setTokens({ access: payload.access, refresh: payload.refresh });
+  apiMode = 'remote';
+
+  const session: AuthSession = {
+    token: payload.access,
+    user: mapUser(payload.user),
+    workspaceId: String(payload.workspace_id),
     isDemo,
   };
+  writeRemoteSession(session);
+  return session;
 }
 
-function resolveWorkspace(database: MockDatabase) {
-  const workspace = database.workspaces[0];
-  if (!workspace) throw new Error('No workspace is available.');
-  return workspace;
+function activeMode(): ApiMode {
+  if (apiMode) return apiMode;
+  apiMode = getTokens() ? 'remote' : 'mock';
+  return apiMode;
 }
 
-function resolveSprint(database: MockDatabase, sprintId?: string): Sprint {
-  const workspace = resolveWorkspace(database);
-  const sprints = database.sprints.filter((sprint) => sprint.workspaceId === workspace.id);
-  const sprint =
-    (sprintId ? sprints.find((item) => item.id === sprintId) : undefined) ??
-    sprints.find((item) => item.status === 'active') ??
-    sprints[0];
-  if (!sprint) throw new Error('No sprint is available.');
-  return sprint;
+function useMockMode(): void {
+  apiMode = 'mock';
 }
 
-const STATUS_INDEX = new Map<TaskStatus, number>(
-  TASK_STATUSES.map((status, index) => [status, index]),
-);
-
-function sortForBoard(tasks: Task[]): Task[] {
-  return [...tasks].sort((a, b) => {
-    const statusDelta =
-      (STATUS_INDEX.get(a.status) ?? 0) - (STATUS_INDEX.get(b.status) ?? 0);
-    return statusDelta !== 0 ? statusDelta : a.order - b.order;
-  });
-}
-
-function makeActivity(
-  taskId: string,
-  actorUser: User,
-  type: Activity['type'],
-  message: string,
-): Activity {
-  return {
-    id: `act_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
-    taskId,
-    actor: clone(actorUser),
-    type,
-    message,
-    createdAt: new Date().toISOString(),
-  };
-}
-
-// ---------------------------------------------------------------------- auth
+// ----------------------------------------------------------------------- auth
 
 export async function getCurrentSession(): Promise<AuthSession | null> {
-  await wait(60);
-  return clone(readSession());
+  const tokens = getTokens();
+  const remoteSession = readRemoteSession();
+
+  if (tokens && remoteSession) {
+    apiMode = 'remote';
+    return remoteSession;
+  }
+
+  if (tokens || remoteSession) {
+    clearTokens();
+    clearRemoteSession();
+  }
+
+  const mockSession = await mockApi.getCurrentSession();
+  if (mockSession) useMockMode();
+  return mockSession;
 }
 
 export async function demoLogin(): Promise<AuthSession> {
-  await wait(420);
-  const database = readDatabase();
-  const workspace = resolveWorkspace(database);
-  const demoUser =
-    database.users.find((user) => user.id === DEMO_USER_ID) ?? database.users[0];
-  if (!demoUser) throw new Error('The demo workspace is missing its owner.');
-
-  const session = createSession(demoUser, workspace.id, true);
-  writeSession(session);
-  return clone(session);
+  try {
+    const payload = await apiFetch<ApiAuthResponse>('/auth/demo-login/', {
+      method: 'POST',
+      body: {},
+      authenticated: false,
+    });
+    return persistAuth(payload, true);
+  } catch (error) {
+    if (!isBackendUnavailable(error)) throw error;
+    useMockMode();
+    return mockApi.demoLogin();
+  }
 }
 
 export async function login(email: string, password: string): Promise<AuthSession> {
-  await wait(500);
-  const normalisedEmail = email.trim().toLowerCase();
-  const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-
-  if (!emailPattern.test(normalisedEmail)) {
-    throw new Error('Enter a valid email address.');
+  try {
+    const payload = await apiFetch<ApiAuthResponse>('/auth/login/', {
+      method: 'POST',
+      body: { email, password },
+      authenticated: false,
+    });
+    return persistAuth(payload, payload.is_demo);
+  } catch (error) {
+    if (!isBackendUnavailable(error)) throw error;
+    useMockMode();
+    return mockApi.login(email, password);
   }
-  if (password.trim().length < 6) {
-    throw new Error('Password must be at least 6 characters.');
-  }
-
-  const database = readDatabase();
-  const workspace = resolveWorkspace(database);
-  const demoUser =
-    database.users.find((user) => user.id === DEMO_USER_ID) ?? database.users[0];
-  if (!demoUser) throw new Error('The workspace is missing its owner.');
-
-  const session = createSession(
-    {
-      ...demoUser,
-      email: normalisedEmail,
-    },
-    workspace.id,
-    false,
-  );
-  writeSession(session);
-  return clone(session);
 }
 
 export async function logout(): Promise<void> {
-  await wait(80);
-  try {
-    window.localStorage.removeItem(SESSION_KEY);
-  } catch {
-    // Ignore storage failures.
-  }
+  clearTokens();
+  clearRemoteSession();
+  useMockMode();
+  await mockApi.logout();
 }
 
-// --------------------------------------------------------------------- board
+// ---------------------------------------------------------------------- board
 
 export async function getBoardData(sprintId?: string): Promise<BoardData> {
-  await wait(180);
-  const database = readDatabase();
-  const workspace = resolveWorkspace(database);
-  const sprint = resolveSprint(database, sprintId);
-  const sprints = database.sprints
-    .filter((item) => item.workspaceId === workspace.id)
-    .sort((a, b) => {
-      if (a.status === 'active') return -1;
-      if (b.status === 'active') return 1;
-      return a.name.localeCompare(b.name);
-    });
+  if (activeMode() === 'mock') {
+    return mockApi.getBoardData(sprintId);
+  }
 
-  const data: BoardData = {
-    workspace,
-    sprint,
-    sprints,
-    columns: [...database.columns].sort((a, b) => a.order - b.order),
-    tasks: sortForBoard(database.tasks.filter((task) => task.sprintId === sprint.id)),
-    members: database.users,
-    labels: database.labels,
-  };
+  const query = sprintId ? `?sprint=${encodeURIComponent(sprintId)}` : '';
 
-  return clone(data);
+  try {
+    const payload = await apiFetch<ApiBoard>(
+      `/workspaces/current/board/${query}`,
+    );
+    return mapBoard(payload);
+  } catch (error) {
+    if (isBackendUnavailable(error)) {
+      useMockMode();
+      return mockApi.getBoardData();
+    }
+    throw error;
+  }
 }
+
+async function resolveColumnId(status: TaskStatus): Promise<number | undefined> {
+  if (currentSprintId) {
+    const cached = columnIds.get(`${currentSprintId}:${status}`);
+    if (cached) return cached;
+  }
+
+  try {
+    await getBoardData();
+  } catch {
+    return undefined;
+  }
+
+  if (!currentSprintId) return undefined;
+  return columnIds.get(`${currentSprintId}:${status}`);
+}
+
+function labelValue(labelIds: string[] | undefined): string {
+  const candidate = labelIds?.[0];
+  return candidate && LABEL_VALUES.includes(candidate) ? candidate : '';
+}
+
+function assigneeValue(assigneeId: string | null | undefined): number | null {
+  if (!assigneeId) return null;
+  const numeric = Number(assigneeId);
+  return Number.isInteger(numeric) && numeric > 0 ? numeric : null;
+}
+
+// ----------------------------------------------------------------------- tasks
 
 export async function createTask(input: CreateTaskInput): Promise<Task> {
-  await wait(140);
-  const title = input.title.trim();
-  if (!title) throw new Error('An issue title is required.');
+  if (activeMode() === 'mock') return mockApi.createTask(input);
 
-  const database = readDatabase();
-  const workspace = resolveWorkspace(database);
-  const sprint = resolveSprint(database, input.sprintId);
-  const author = currentUser(database);
-  const nowIso = new Date().toISOString();
+  const status = input.status ?? 'backlog';
+  const columnId = await resolveColumnId(status);
 
-  const highestKey = database.tasks.reduce((highest, task) => {
-    const match = /^NEX-(\d+)$/.exec(task.key);
-    if (!match) return highest;
-    return Math.max(highest, Number(match[1]));
-  }, 100);
+  if (!columnId || activeMode() === 'mock') {
+    return mockApi.createTask(input);
+  }
 
-  const status: TaskStatus = input.status ?? 'backlog';
-  const order = database.tasks.filter(
-    (task) => task.sprintId === sprint.id && task.status === status,
-  ).length;
+  const task = await apiFetch<ApiTask>('/tasks/', {
+    method: 'POST',
+    body: {
+      column: columnId,
+      title: input.title.trim(),
+      description: input.description ?? '',
+      priority: input.priority ?? 'medium',
+      label: labelValue(input.labelIds),
+      story_points: Math.max(0, Math.round(input.storyPoints ?? 0)),
+      assignee_id: input.assigneeId ? assigneeValue(input.assigneeId) : null,
+    },
+  });
 
-  const taskId = `tsk_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
-  const task: Task = {
-    id: taskId,
-    key: `NEX-${highestKey + 1}`,
-    workspaceId: workspace.id,
-    sprintId: sprint.id,
-    title,
-    description: input.description?.trim() ?? '',
-    status,
-    priority: input.priority ?? 'medium',
-    storyPoints: Math.max(0, Math.round(input.storyPoints ?? 0)),
-    assigneeId: input.assigneeId ?? author.id,
-    labelIds: input.labelIds ?? [],
-    order,
-    createdAt: nowIso,
-    updatedAt: nowIso,
-    comments: [],
-    activity: [makeActivity(taskId, author, 'created', 'created the issue')],
-  };
-
-  database.tasks.push(task);
-  writeDatabase(database);
-  return clone(task);
+  return mapTask(task);
 }
 
-export async function updateTask(taskId: string, patch: UpdateTaskInput): Promise<Task> {
-  await wait(110);
-  const database = readDatabase();
-  const task = database.tasks.find((item) => item.id === taskId);
-  if (!task) throw new Error('That issue could not be found.');
-
-  const author = currentUser(database);
-  const changes: Activity[] = [];
-  const nowIso = new Date().toISOString();
-
-  if (patch.title !== undefined) {
-    const title = patch.title.trim();
-    if (!title) throw new Error('An issue title is required.');
-    if (title !== task.title) {
-      task.title = title;
-      changes.push(makeActivity(task.id, author, 'title_changed', 'renamed the issue'));
-    }
+export async function updateTask(
+  taskId: string,
+  patch: UpdateTaskInput,
+): Promise<Task> {
+  if (activeMode() === 'mock' || taskId.startsWith('tsk_')) {
+    return mockApi.updateTask(taskId, patch);
   }
 
-  if (patch.description !== undefined && patch.description !== task.description) {
-    task.description = patch.description;
-    changes.push(
-      makeActivity(task.id, author, 'description_changed', 'updated the description'),
-    );
-  }
-
-  if (patch.priority !== undefined && patch.priority !== task.priority) {
-    const previousPriority: Priority = task.priority;
-    task.priority = patch.priority;
-    changes.push(
-      makeActivity(
-        task.id,
-        author,
-        'priority_changed',
-        `changed priority from ${PRIORITY_META[previousPriority].label} to ${PRIORITY_META[patch.priority].label}`,
-      ),
-    );
-  }
-
-  if (patch.assigneeId !== undefined && patch.assigneeId !== task.assigneeId) {
-    const assignee = patch.assigneeId
-      ? database.users.find((user) => user.id === patch.assigneeId)
-      : null;
-    if (patch.assigneeId && !assignee) throw new Error('That teammate could not be found.');
-    task.assigneeId = patch.assigneeId;
-    changes.push(
-      makeActivity(
-        task.id,
-        author,
-        'assignee_changed',
-        assignee ? `assigned this issue to ${assignee.name}` : 'unassigned this issue',
-      ),
-    );
-  }
-
-  if (patch.labelIds !== undefined) {
-    const current = [...task.labelIds].sort().join(',');
-    const next = [...patch.labelIds].sort().join(',');
-    if (current !== next) {
-      task.labelIds = [...patch.labelIds];
-      changes.push(makeActivity(task.id, author, 'labels_changed', 'updated the labels'));
-    }
-  }
-
+  const payload: Record<string, unknown> = {};
+  if (patch.title !== undefined) payload.title = patch.title;
+  if (patch.description !== undefined) payload.description = patch.description;
+  if (patch.priority !== undefined) payload.priority = patch.priority;
   if (patch.storyPoints !== undefined) {
-    const points = Math.max(0, Math.round(patch.storyPoints));
-    if (points !== task.storyPoints) {
-      const previousPoints = task.storyPoints;
-      task.storyPoints = points;
-      changes.push(
-        makeActivity(
-          task.id,
-          author,
-          'points_changed',
-          `changed story points from ${previousPoints} to ${points}`,
-        ),
-      );
+    payload.story_points = Math.max(0, Math.round(patch.storyPoints));
+  }
+  if (patch.assigneeId !== undefined) {
+    payload.assignee_id = assigneeValue(patch.assigneeId);
+  }
+  if (patch.labelIds !== undefined) {
+    payload.label = labelValue(patch.labelIds);
+  }
+
+  let updated = await apiFetch<ApiTask>(`/tasks/${taskId}/`, {
+    method: 'PATCH',
+    body: payload,
+  });
+
+  if (patch.status && patch.status !== updated.column_slug) {
+    const columnId = await resolveColumnId(patch.status);
+    if (columnId) {
+      const moved = await apiFetch<ApiMoveResponse>(`/tasks/${taskId}/move/`, {
+        method: 'POST',
+        body: { target_column_id: columnId, new_position: 100_000 },
+      });
+      updated = moved.task;
     }
   }
 
-  let finalTask = task;
-
-  if (patch.status !== undefined && patch.status !== task.status) {
-    const previousStatus = task.status;
-    database.tasks = reorderTaskList(
-      database.tasks,
-      task.id,
-      patch.status,
-      Number.MAX_SAFE_INTEGER,
-    );
-    const moved = database.tasks.find((item) => item.id === task.id);
-    if (!moved) throw new Error('That issue could not be moved.');
-
-    changes.push(
-      makeActivity(
-        moved.id,
-        author,
-        'status_changed',
-        `moved this issue from ${STATUS_META[previousStatus].label} to ${STATUS_META[patch.status].label}`,
-      ),
-    );
-    finalTask = moved;
-  }
-
-  finalTask.updatedAt = nowIso;
-  finalTask.activity = [...finalTask.activity, ...changes];
-  writeDatabase(database);
-  return clone(finalTask);
+  return mapTask(updated);
 }
 
 export async function moveTask(input: MoveTaskInput): Promise<Task[]> {
-  await wait(90);
-  const database = readDatabase();
-  const task = database.tasks.find((item) => item.id === input.taskId);
-  if (!task) throw new Error('That issue could not be found.');
-
-  const previousStatus = task.status;
-  database.tasks = reorderTaskList(
-    database.tasks,
-    input.taskId,
-    input.toStatus,
-    input.toIndex,
-  );
-
-  const moved = database.tasks.find((item) => item.id === input.taskId);
-  if (!moved) throw new Error('That issue could not be moved.');
-
-  moved.updatedAt = new Date().toISOString();
-  if (previousStatus !== input.toStatus) {
-    const author = currentUser(database);
-    moved.activity = [
-      ...moved.activity,
-      makeActivity(
-        moved.id,
-        author,
-        'status_changed',
-        `moved this issue from ${STATUS_META[previousStatus].label} to ${STATUS_META[input.toStatus].label}`,
-      ),
-    ];
+  if (activeMode() === 'mock' || input.taskId.startsWith('tsk_')) {
+    return mockApi.moveTask(input);
   }
 
-  writeDatabase(database);
-  return clone(
-    sortForBoard(database.tasks.filter((item) => item.sprintId === moved.sprintId)),
-  );
-}
+  const columnId = await resolveColumnId(input.toStatus);
+  if (!columnId) {
+    throw new Error('The target column could not be resolved.');
+  }
 
-// ------------------------------------------------------------------ comments
+  const response = await apiFetch<ApiMoveResponse>(
+    `/tasks/${input.taskId}/move/`,
+    {
+      method: 'POST',
+      body: {
+        target_column_id: columnId,
+        new_position: input.toIndex,
+      },
+    },
+  );
+
+  return response.tasks.map(mapTask);
+}
 
 export async function addComment(taskId: string, body: string): Promise<Comment> {
-  await wait(130);
-  const text = body.trim();
-  if (!text) throw new Error('A comment cannot be empty.');
+  if (activeMode() === 'mock' || taskId.startsWith('tsk_')) {
+    return mockApi.addComment(taskId, body);
+  }
 
-  const database = readDatabase();
-  const task = database.tasks.find((item) => item.id === taskId);
-  if (!task) throw new Error('That issue could not be found.');
+  const comment = await apiFetch<ApiComment>(`/tasks/${taskId}/comments/`, {
+    method: 'POST',
+    body: { content: body.trim() },
+  });
 
-  const comment: Comment = {
-    id: `cmt_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`,
-    taskId,
-    author: clone(currentUser(database)),
-    body: text,
-    createdAt: new Date().toISOString(),
-  };
-
-  task.comments.push(comment);
-  task.updatedAt = comment.createdAt;
-  writeDatabase(database);
-  return clone(comment);
+  return mapComment(comment, taskId);
 }
+
+// Re-export the typed error so UI code can distinguish validation failures.
+export { ApiError };
